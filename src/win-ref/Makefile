@@ -11,7 +11,7 @@ CFLAGS  := -O2 -std=c11 -Wall -Wextra -I$(SDL)/include/SDL2 -Iz80
 LDFLAGS := -L$(SDL)/lib
 LIBS    := -lmingw32 -lSDL2main -lSDL2
 
-SRC := main.c machine.c mc8123.c video.c z80/z80.c
+SRC := main.c machine.c mc8123.c video.c sn76489.c z80/z80.c
 OBJ := $(SRC:.c=.o)
 
 EXE := $(BUILD)/wbml-ref.exe

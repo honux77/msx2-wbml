@@ -8,8 +8,13 @@ Usage: python tools/disasm.py <start_hex> <count>
 """
 import sys
 
-op = open("build/main_opcodes.bin", "rb").read()
-da = open("build/main_data.bin", "rb").read()
+# Default: MC-8123 main CPU (opcode view + data view). With a 3rd arg naming a
+# plaintext binary (e.g. the sound ROM), use it for both views.
+if len(sys.argv) > 3:
+    op = da = open(sys.argv[3], "rb").read()
+else:
+    op = open("build/main_opcodes.bin", "rb").read()
+    da = open("build/main_data.bin", "rb").read()
 
 R = ["b", "c", "d", "e", "h", "l", "(hl)", "a"]
 RP = ["bc", "de", "hl", "sp"]

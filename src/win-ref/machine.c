@@ -10,10 +10,10 @@
 #define FPS          60.06
 #define CYC_PER_FRAME ((unsigned)(MAIN_CLOCK / FPS))
 
-// Set 1 to also run the sound CPU (silent until SN76489 is wired up).
 #define RUN_SOUND_CPU 1
-#define SOUND_CLOCK_HZ 4000000
-#define SCYC_PER_FRAME ((unsigned)(SOUND_CLOCK_HZ / FPS))
+#define SOUND_XTAL    8000000              // SOUND_CLOCK
+#define SOUND_CPU_HZ  (SOUND_XTAL / 2)     // sound Z80 = 4MHz
+#define SCYC_PER_FRAME ((unsigned)(SOUND_CPU_HZ / FPS))
 
 // ---- main CPU memory space ------------------------------------------------
 
@@ -71,6 +71,10 @@ static void main_write(void *ud, uint16_t addr, uint8_t val) {
 // ---- main CPU I/O space (8255 PPI), global_mask 0x1f ----------------------
 
 int g_io_log = 0;  // set by diagnostic harness to trace PPI port B/C writes
+int g_sn_solo = 0; // 0 = both chips, 1 = SN1 only, 2 = SN2 only (diagnostics)
+int g_sn_log = 0;  // log SN register writes
+FILE *g_sn_logfile = NULL;  // destination for SN write log (stderr or a file)
+unsigned long g_sn_writes = 0, g_latch_reads = 0, g_snd_nmi = 0, g_snd_irq = 0, g_snd_irq_taken = 0, g_snd_loop = 0, g_snd_driver = 0;
 
 static void videomode_w(system2 *m, uint8_t data) {
     if (g_io_log && ((m->video_mode ^ data) & 0x10))
@@ -84,9 +88,9 @@ static void videomode_w(system2 *m, uint8_t data) {
 }
 
 static void sound_control_w(system2 *m, uint8_t data) {
+    // PPI port C: low bits drive video RAM banking; the sound-CPU NMI is the
+    // port-A OBF handshake (mode 2), handled in main_port_out, not here.
     m->ppi_portc = data;
-    // bit7 controls sound CPU NMI; remaining bits = video RAM banking
-    m->sound_nmi_mask = (data & 0x80) ? 1 : 0;
     m->videoram_bank = data;
 }
 
@@ -110,8 +114,18 @@ static uint8_t main_port_in(z80 *z, uint8_t port) {
 
 static void main_port_out(z80 *z, uint8_t port, uint8_t val) {
     system2 *m = (system2 *)z->userdata;
+    if (g_io_log && ((port & 0x1f) == 0x14 || (port & 0x1f) == 0x16 || (port & 0x1f) == 0x17))
+        fprintf(stderr, "[io] PC=%04X OUT(%02X)=%02X portc=%02X\n",
+                m->maincpu.pc, port & 0x1f, val, m->ppi_portc);
     switch (port & 0x1f) {
-        case 0x14: m->soundlatch = val; break;            // PPI port A -> sound latch
+        case 0x14:
+            // PPI port A is in mode 2; writing a sound command raises OBF,
+            // which is wired to the sound CPU's NMI. Deliver the command and
+            // pulse the NMI so the sound CPU's NMI handler reads the latch.
+            m->soundlatch = val;
+            g_snd_nmi++;
+            z80_gen_nmi(&m->soundcpu);
+            break;
         case 0x15: videomode_w(m, val); break;            // PPI port B
         case 0x16: sound_control_w(m, val); break;        // PPI port C
         case 0x17:                                        // PPI control: BSR on port C
@@ -133,6 +147,7 @@ static uint8_t sound_read(void *ud, uint16_t addr) {
     if (addr < 0x8000) return m->soundrom[addr];
     if (addr >= 0x8000 && addr < 0x8800) return m->soundram[addr - 0x8000];
     if ((addr & 0xe000) == 0xe000) {
+        g_latch_reads++;
         // sound CPU read of the latch toggles PPI port C bit6 (sound ack),
         // which the main CPU polls to confirm the command was consumed.
         m->ppi_portc &= ~0x40;
@@ -144,9 +159,9 @@ static uint8_t sound_read(void *ud, uint16_t addr) {
 
 static void sound_write(void *ud, uint16_t addr, uint8_t val) {
     system2 *m = (system2 *)ud;
-    if (addr >= 0x8000 && addr < 0x8800) m->soundram[addr - 0x8000] = val;
-    // a000 = SN1, c000 = SN2 -> not yet implemented
-    (void)val;
+    if (addr >= 0x8000 && addr < 0x8800) { m->soundram[addr - 0x8000] = val; return; }
+    if ((addr & 0xe000) == 0xa000) { g_sn_writes++; if (g_sn_log && g_sn_logfile) fprintf(g_sn_logfile,"[sn1] %02X\n",val); sn_write(&m->sn1, val); return; }  // SN1
+    if ((addr & 0xe000) == 0xc000) { g_sn_writes++; if (g_sn_log && g_sn_logfile) fprintf(g_sn_logfile,"[sn2] %02X\n",val); sn_write(&m->sn2, val); return; }  // SN2
 }
 
 static uint8_t sound_port_in(z80 *z, uint8_t port) { (void)z; (void)port; return 0xff; }
@@ -215,24 +230,67 @@ int machine_init(system2 *m, const char *romdir) {
     m->soundcpu.port_in = sound_port_in;
     m->soundcpu.port_out = sound_port_out;
 
+    // SN76489A clocks: SN1 = SOUND_CLOCK/4 = 2MHz, SN2 = SOUND_CLOCK/2 = 4MHz
+    sn_init(&m->sn1, SOUND_XTAL / 4, AUDIO_SAMPLE_RATE);
+    sn_init(&m->sn2, SOUND_XTAL / 2, AUDIO_SAMPLE_RATE);
+    m->sound_nmi_prev = 1;
+
     return 0;
 }
 
-void machine_run_frame(system2 *m, uint32_t *framebuffer) {
-    unsigned long target = m->maincpu.cyc + CYC_PER_FRAME;
-    while (m->maincpu.cyc < target)
-        z80_step(&m->maincpu);
+// Run both CPUs interleaved in slices so the sound latch handshake and audio
+// register writes line up with their timing; generate audio per slice.
+#define SLICES 8
 
-    // VBLANK -> main CPU IRQ (IM1 -> RST 38)
-    z80_gen_int(&m->maincpu, 0xff);
+int machine_run_frame(system2 *m, uint32_t *framebuffer, int16_t *audio) {
+    const int total_samples = AUDIO_SAMPLE_RATE / 60;  // ~735
+    int32_t mix[AUDIO_MAX_FRAME];
+    int produced = 0;
+
+    for (int sl = 0; sl < SLICES; sl++) {
+        unsigned long mtarget = m->maincpu.cyc + CYC_PER_FRAME / SLICES;
+        while (m->maincpu.cyc < mtarget)
+            z80_step(&m->maincpu);
 
 #if RUN_SOUND_CPU
-    unsigned long starget = m->soundcpu.cyc + CYC_PER_FRAME;
-    while (m->soundcpu.cyc < starget)
-        z80_step(&m->soundcpu);
-    if (!m->sound_nmi_mask)
-        z80_gen_nmi(&m->soundcpu);
+        unsigned long starget = m->soundcpu.cyc + SCYC_PER_FRAME / SLICES;
+        while (m->soundcpu.cyc < starget) {
+            z80_step(&m->soundcpu);
+            if (m->soundcpu.pc == 0x0038) g_snd_irq_taken++;  // entered IRQ vector
+            if (m->soundcpu.pc == 0x00DC) g_snd_loop++;       // main loop completed one turn
+            if (m->soundcpu.pc == 0x03AF) g_snd_driver++;     // music driver entered
+        }
+
+        // sound IRQ fires on a scanline timer ~4x/frame (every other slice).
+        // (sound NMI is handled immediately in sound_control_w, not here.)
+        if ((sl & 1) == 0) {
+            g_snd_irq++;
+            z80_gen_int(&m->soundcpu, 0xff);
+        }
 #endif
 
+        // render this slice's audio
+        int n = total_samples * (sl + 1) / SLICES - produced;
+        if (n > 0) {
+            for (int i = 0; i < n; i++) mix[produced + i] = 0;
+            // gain 0 keeps a chip's clock advancing while muting it (for solo diagnostics)
+            sn_render_add(&m->sn1, mix + produced, n, g_sn_solo == 2 ? 0.0 : 0.40);
+            sn_render_add(&m->sn2, mix + produced, n, g_sn_solo == 1 ? 0.0 : 0.60);
+            produced += n;
+        }
+    }
+
+    // VBLANK -> main CPU IRQ (IM1 -> RST 38), once per frame
+    z80_gen_int(&m->maincpu, 0xff);
+
+    // clamp mix to int16
+    for (int i = 0; i < produced; i++) {
+        int32_t v = mix[i];
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        audio[i] = (int16_t)v;
+    }
+
     video_render(m, framebuffer);
+    return produced;
 }

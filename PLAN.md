@@ -77,8 +77,10 @@ fc00-ffff  sprite collision reset
   - `src/win-ref/z80/` — Z80 코어 (opcode 페치 훅 패치됨)
   - `src/win-ref/machine.*` — 메모리맵, 뱅킹, PPI, I/O, 두 Z80 연결
   - `src/win-ref/video.*` — System 2 렌더러 (system1_v.cpp 포트)
-  - `src/win-ref/sn76489.*` — 사운드 칩
-  - `src/win-ref/main.c` — SDL2 윈도우/입력/60Hz 루프
+  - `src/win-ref/sn76489.*` — SN76489A PSG (MAME 충실 포팅, LFSR feedback 0x10000/탭 비트2,3)
+  - `src/win-ref/main.c` — SDL2 윈도우/입력/오디오/60Hz 루프
+- **오디오 파이프라인**: 프레임당 8슬라이스로 main+sound Z80 인터리브, 슬라이스마다 SN 샘플 생성 →
+  44.1kHz 모노 → SDL_QueueAudio. SN1=2MHz(gain0.40), SN2=4MHz(gain0.60).
 
 ## Phase B 구현 (MSX2+ 리메이크) — 추후 상세화
 
@@ -96,7 +98,8 @@ fc00-ffff  sprite collision reset
 - [x] SDL2 벤더링
 - [x] Phase A: machine (메모리맵/뱅킹/PPI/I/O) + video (System 2 렌더러) + host (SDL2)
 - [x] Phase A 플레이 가능 검증 — 타이틀 화면 + 어트랙트 데모 정상 (build/dbg_300.png, f1100.png)
-- [ ] Phase A 사운드: 사운드 Z80 + SN76489A ×2 (현재 무음, RUN_SOUND_CPU=1로 CPU는 동작)
+- [x] Phase A 사운드: 사운드 Z80 + SN76489A ×2 — MAME sn76496.cpp 충실 포팅, 두 CPU 인터리브
+      실행으로 래치 핸드셰이크/음정 타이밍 정합. 타이틀 음악 E옥타브 정상 (build/dbg.wav로 검증)
 - [ ] Phase B 착수
 
 ### 디버깅 도구

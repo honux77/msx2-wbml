@@ -6,16 +6,48 @@
 #include "video.h"
 
 int main(int argc, char **argv) {
-    extern int g_io_log;
+    extern int g_io_log, g_sn_solo, g_sn_log; extern FILE *g_sn_logfile;
     g_io_log = 1;
+    { char *e = getenv("SN_SOLO"); if (e) g_sn_solo = atoi(e); }
+    { char *e = getenv("SN_LOG");  if (e) { g_sn_log = atoi(e); g_sn_logfile = stderr; } }
     const char *romdir = (argc > 1) ? argv[1] : "roms/wbml";
     int frames = (argc > 2) ? atoi(argv[2]) : 240;
     static system2 m;
     if (machine_init(&m, romdir)) { printf("init failed\n"); return 1; }
 
     static uint32_t fb[SCREEN_W * SCREEN_H];
-    for (int i = 0; i < frames; i++)
-        machine_run_frame(&m, fb);
+    static int16_t audio[AUDIO_MAX_FRAME];
+    // capture audio to a 16-bit mono WAV for inspection
+    FILE *wf = fopen("build/dbg.wav", "wb");
+    long total = 0;
+    if (wf) for (int i = 0; i < 44; i++) fputc(0, wf);  // header placeholder
+    // Optional 4th arg "play": auto-insert a coin and press start so the trace
+    // reaches actual gameplay (where BGM/SFX really run).
+    int play = (argc > 4 && strcmp(argv[4], "play") == 0);
+    for (int i = 0; i < frames; i++) {
+        if (play) {
+            m.in.system = 0;
+            if (i >= 30 && i < 40)  m.in.system = 0x01;  // coin1
+            if (i >= 80 && i < 90)  m.in.system = 0x10;  // start1
+        }
+        int ns = machine_run_frame(&m, fb, audio);
+        if (wf) { fwrite(audio, sizeof(int16_t), ns, wf); total += ns; }
+    }
+    if (wf) {
+        // backfill canonical 44.1kHz mono PCM WAV header
+        long datalen = total * 2, rifflen = 36 + datalen;
+        fseek(wf, 0, SEEK_SET);
+        fwrite("RIFF", 1, 4, wf); fputc(rifflen & 0xff, wf); fputc((rifflen>>8)&0xff, wf);
+        fputc((rifflen>>16)&0xff, wf); fputc((rifflen>>24)&0xff, wf);
+        fwrite("WAVEfmt ", 1, 8, wf);
+        int32_t fmtlen = 16; int16_t pcm = 1, ch = 1, bps = 16; int32_t sr = AUDIO_SAMPLE_RATE;
+        int32_t byterate = sr * 2; int16_t blockalign = 2;
+        fwrite(&fmtlen,4,1,wf); fwrite(&pcm,2,1,wf); fwrite(&ch,2,1,wf);
+        fwrite(&sr,4,1,wf); fwrite(&byterate,4,1,wf); fwrite(&blockalign,2,1,wf); fwrite(&bps,2,1,wf);
+        fwrite("data",1,4,wf); fputc(datalen&0xff,wf); fputc((datalen>>8)&0xff,wf);
+        fputc((datalen>>16)&0xff,wf); fputc((datalen>>24)&0xff,wf);
+        fclose(wf);
+    }
 
     // dump the final rendered frame for visual inspection
     FILE *pf = fopen("build/dbg.ppm", "wb");
@@ -35,6 +67,17 @@ int main(int argc, char **argv) {
     printf("video_mode=%02X flip=%d bank1=%d videoram_bank=%02X nmi_mask=%d\n",
            m.video_mode, m.flip, m.bank1, m.videoram_bank, m.sound_nmi_mask);
     printf("ppi_portc=%02X soundlatch=%02X\n", m.ppi_portc, m.soundlatch);
+    {
+        extern unsigned long g_sn_writes, g_latch_reads, g_snd_nmi, g_snd_irq,
+                             g_snd_irq_taken, g_snd_loop, g_snd_driver;
+        z80 *sc = &m.soundcpu;
+        printf("[sound] PC=%04X iff1=%d halted=%d cyc=%lu\n",
+               sc->pc, sc->iff1, sc->halted, sc->cyc);
+        printf("[sound] sn_writes=%lu latch_reads=%lu nmi=%lu irq_gen=%lu irq_taken=%lu (over %d frames)\n",
+               g_sn_writes, g_latch_reads, g_snd_nmi, g_snd_irq, g_snd_irq_taken, frames);
+        printf("[sound] mainloop_turns=%lu music_driver_calls=%lu (expect ~%d at 4/frame)\n",
+               g_snd_loop, g_snd_driver, frames * 4);
+    }
 
     int pal_nz = 0; for (int i = 0; i < 0x800; i++) if (m.paletteram[i]) pal_nz++;
     int vr_nz = 0;  for (int i = 0; i < VIDEORAM_SIZE; i++) if (m.videoram[i]) vr_nz++;

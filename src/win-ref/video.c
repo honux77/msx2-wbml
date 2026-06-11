@@ -137,19 +137,22 @@ void video_render(system2 *m, uint32_t *fb) {
     };
     uint16_t *fg = page_pix[0];
 
+    // wbml uses screen_update_system2 (a single screen-wide X scroll), NOT the
+    // per-row rowscroll variant. Reading 0x7c0+y*2 per row would scatter the
+    // background; the scroll comes from one register pair at 0x7c0/0x7c1.
     int rowscroll[32];
-    int yscroll, sprxoffset;
+    int yscroll, sprxoffset, xscroll;
     if (!m->flip) {
-        for (int y = 0; y < 32; y++)
-            rowscroll[y] = ((vr[0x7c0 + y * 2] | (vr[0x7c1 + y * 2] << 8)) & 0x1ff) - 512 + 10;
+        xscroll = ((vr[0x7c0] | (vr[0x7c1] << 8)) & 0x1ff) - 512 + 10;
         yscroll = vr[0x7ba];
         sprxoffset = 14;
     } else {
-        for (int y = 0; y < 32; y++)
-            rowscroll[y] = 512 + 512 + 10 - (((vr[0x7fe - y * 2] | (vr[0x7ff - y * 2] << 8)) & 0x1ff) - 512 + 10);
+        xscroll = 512 + 512 + 10 - (((vr[0x7f6] | (vr[0x7f7] << 8)) & 0x1ff) - 512 + 10);
         yscroll = 512 + 512 - vr[0x784];
         sprxoffset = -14;
     }
+    for (int y = 0; y < 32; y++)
+        rowscroll[y] = xscroll;
 
     draw_sprites(m, sprxoffset);
 
