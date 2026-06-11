@@ -75,6 +75,7 @@ int g_sn_solo = 0; // 0 = both chips, 1 = SN1 only, 2 = SN2 only (diagnostics)
 int g_sn_log = 0;  // log SN register writes
 FILE *g_sn_logfile = NULL;  // destination for SN write log (stderr or a file)
 unsigned long g_sn_writes = 0, g_latch_reads = 0, g_snd_nmi = 0, g_snd_irq = 0, g_snd_irq_taken = 0, g_snd_loop = 0, g_snd_driver = 0;
+unsigned long g_frame = 0;
 
 static void videomode_w(system2 *m, uint8_t data) {
     if (g_io_log && ((m->video_mode ^ data) & 0x10))
@@ -88,10 +89,17 @@ static void videomode_w(system2 *m, uint8_t data) {
 }
 
 static void sound_control_w(system2 *m, uint8_t data) {
-    // PPI port C: low bits drive video RAM banking; the sound-CPU NMI is the
-    // port-A OBF handshake (mode 2), handled in main_port_out, not here.
+    // PPI port C: low bits drive video RAM banking. In mode 2, bits 6/7 are
+    // handshake lines for port A rather than normal output bits; bit 7 is the
+    // active-low OBF line wired to the sound CPU NMI.
+    int prev_clear = m->sound_nmi_mask;
     m->ppi_portc = data;
     m->videoram_bank = data;
+    m->sound_nmi_mask = (data & 0x80) ? 1 : 0;
+    if (prev_clear && !m->sound_nmi_mask) {
+        g_snd_nmi++;
+        z80_gen_nmi(&m->soundcpu);
+    }
 }
 
 static uint8_t main_port_in(z80 *z, uint8_t port) {
@@ -119,21 +127,27 @@ static void main_port_out(z80 *z, uint8_t port, uint8_t val) {
                 m->maincpu.pc, port & 0x1f, val, m->ppi_portc);
     switch (port & 0x1f) {
         case 0x14:
-            // PPI port A is in mode 2; writing a sound command raises OBF,
-            // which is wired to the sound CPU's NMI. Deliver the command and
-            // pulse the NMI so the sound CPU's NMI handler reads the latch.
             m->soundlatch = val;
-            g_snd_nmi++;
-            z80_gen_nmi(&m->soundcpu);
+            if (g_sn_log && g_sn_logfile)
+                fprintf(g_sn_logfile, "[cmd] f=%lu mcyc=%lu pc=%04X val=%02X portc=%02X 8072=%02X\n",
+                        g_frame, m->maincpu.cyc, m->maincpu.pc, val, m->ppi_portc,
+                        m->soundram[0x72]);
+            // Port A write lowers OBF and clears the read-ack feedback until
+            // the sound CPU consumes the latch.
+            sound_control_w(m, (uint8_t)(m->ppi_portc & ~0xc0));
             break;
         case 0x15: videomode_w(m, val); break;            // PPI port B
-        case 0x16: sound_control_w(m, val); break;        // PPI port C
+        case 0x16:                                        // PPI port C
+            sound_control_w(m, (uint8_t)((m->ppi_portc & 0xc0) | (val & 0x3f)));
+            break;
         case 0x17:                                        // PPI control: BSR on port C
             if (!(val & 0x80)) {
                 int bit = (val >> 1) & 7;
                 uint8_t pc = m->ppi_portc;
-                if (val & 1) pc |= (1 << bit); else pc &= ~(1 << bit);
-                sound_control_w(m, pc);
+                if (bit < 6) {
+                    if (val & 1) pc |= (1 << bit); else pc &= ~(1 << bit);
+                    sound_control_w(m, pc);
+                }
             }
             break;
         default: break;
@@ -145,13 +159,14 @@ static void main_port_out(z80 *z, uint8_t port, uint8_t val) {
 static uint8_t sound_read(void *ud, uint16_t addr) {
     system2 *m = (system2 *)ud;
     if (addr < 0x8000) return m->soundrom[addr];
-    if (addr >= 0x8000 && addr < 0x8800) return m->soundram[addr - 0x8000];
+    // 2KB SRAM chip: only A[10:0] decoded, mirrors across 0x8000-0x9FFF
+    if (addr >= 0x8000 && addr < 0xA000) return m->soundram[addr & 0x7FF];
     if ((addr & 0xe000) == 0xe000) {
         g_latch_reads++;
         // sound CPU read of the latch toggles PPI port C bit6 (sound ack),
         // which the main CPU polls to confirm the command was consumed.
         m->ppi_portc &= ~0x40;
-        m->ppi_portc |= 0x40;
+        sound_control_w(m, (uint8_t)(m->ppi_portc | 0xc0));
         return m->soundlatch;
     }
     return 0xff;
@@ -159,9 +174,31 @@ static uint8_t sound_read(void *ud, uint16_t addr) {
 
 static void sound_write(void *ud, uint16_t addr, uint8_t val) {
     system2 *m = (system2 *)ud;
-    if (addr >= 0x8000 && addr < 0x8800) { m->soundram[addr - 0x8000] = val; return; }
-    if ((addr & 0xe000) == 0xa000) { g_sn_writes++; if (g_sn_log && g_sn_logfile) fprintf(g_sn_logfile,"[sn1] %02X\n",val); sn_write(&m->sn1, val); return; }  // SN1
-    if ((addr & 0xe000) == 0xc000) { g_sn_writes++; if (g_sn_log && g_sn_logfile) fprintf(g_sn_logfile,"[sn2] %02X\n",val); sn_write(&m->sn2, val); return; }  // SN2
+    // 2KB SRAM chip: only A[10:0] decoded, mirrors across 0x8000-0x9FFF
+    if (addr >= 0x8000 && addr < 0xA000) {
+        uint16_t idx = addr & 0x7FF;
+        if (g_sn_log && g_sn_logfile && idx == 0x072)
+            fprintf(g_sn_logfile, "[ram72] f=%lu scyc=%lu pc=%04X %02X->%02X (addr=%04X)\n",
+                    g_frame, m->soundcpu.cyc, m->soundcpu.pc, m->soundram[0x72], val, addr);
+        m->soundram[idx] = val;
+        return;
+    }
+    if ((addr & 0xe000) == 0xa000) {
+        g_sn_writes++;
+        if (g_sn_log && g_sn_logfile)
+            fprintf(g_sn_logfile, "[sn1] f=%lu scyc=%lu pc=%04X %02X\n",
+                    g_frame, m->soundcpu.cyc, m->soundcpu.pc, val);
+        sn_write(&m->sn1, val);
+        return;
+    }
+    if ((addr & 0xe000) == 0xc000) {
+        g_sn_writes++;
+        if (g_sn_log && g_sn_logfile)
+            fprintf(g_sn_logfile, "[sn2] f=%lu scyc=%lu pc=%04X %02X\n",
+                    g_frame, m->soundcpu.cyc, m->soundcpu.pc, val);
+        sn_write(&m->sn2, val);
+        return;
+    }
 }
 
 static uint8_t sound_port_in(z80 *z, uint8_t port) { (void)z; (void)port; return 0xff; }
@@ -230,9 +267,12 @@ int machine_init(system2 *m, const char *romdir) {
     m->soundcpu.port_in = sound_port_in;
     m->soundcpu.port_out = sound_port_out;
 
-    // SN76489A clocks: SN1 = SOUND_CLOCK/4 = 2MHz, SN2 = SOUND_CLOCK/2 = 4MHz
+    // SN76489A clocks: SN1 = SOUND_CLOCK/4 = 2MHz, SN2 = SOUND_CLOCK/2 = 4MHz.
     sn_init(&m->sn1, SOUND_XTAL / 4, AUDIO_SAMPLE_RATE);
     sn_init(&m->sn2, SOUND_XTAL / 2, AUDIO_SAMPLE_RATE);
+    m->ppi_portc = 0xc0;
+    m->videoram_bank = m->ppi_portc;
+    m->sound_nmi_mask = 1;
     m->sound_nmi_prev = 1;
 
     return 0;
@@ -292,5 +332,6 @@ int machine_run_frame(system2 *m, uint32_t *framebuffer, int16_t *audio) {
     }
 
     video_render(m, framebuffer);
+    g_frame++;
     return produced;
 }

@@ -653,6 +653,21 @@ static inline uint16_t displace(
 }
 
 static inline void process_interrupts(z80* const z) {
+  // NMI is edge-triggered and non-maskable: it fires regardless of IFF1, IFF2,
+  // or the EI one-instruction delay. Real Z80 saves IFF1→IFF2 before clearing
+  // IFF1, so RETN can restore the pre-NMI interrupt state.
+  if (z->nmi_pending) {
+    z->nmi_pending = 0;
+    z->halted = 0;
+    z->iff2 = z->iff1;
+    z->iff1 = 0;
+    inc_r(z);
+
+    z->cyc += 11;
+    call(z, 0x66);
+    return;
+  }
+
   // "When an EI instruction is executed, any pending interrupt request
   // is not accepted until after the instruction following EI is executed."
   if (z->iff_delay > 0) {
@@ -661,17 +676,6 @@ static inline void process_interrupts(z80* const z) {
       z->iff1 = 1;
       z->iff2 = 1;
     }
-    return;
-  }
-
-  if (z->nmi_pending) {
-    z->nmi_pending = 0;
-    z->halted = 0;
-    z->iff1 = 0;
-    inc_r(z);
-
-    z->cyc += 11;
-    call(z, 0x66);
     return;
   }
 

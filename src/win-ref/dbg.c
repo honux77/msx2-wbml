@@ -77,6 +77,11 @@ int main(int argc, char **argv) {
                g_sn_writes, g_latch_reads, g_snd_nmi, g_snd_irq, g_snd_irq_taken, frames);
         printf("[sound] mainloop_turns=%lu music_driver_calls=%lu (expect ~%d at 4/frame)\n",
                g_snd_loop, g_snd_driver, frames * 4);
+        printf("[sound_ram] 8000=%02X 8012=%02X 801D=%02X 8072=%02X\n",
+               m.soundram[0x00], m.soundram[0x12], m.soundram[0x1D], m.soundram[0x72]);
+        printf("[sound_ram] ring_buf 8020..8027: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               m.soundram[0x20], m.soundram[0x21], m.soundram[0x22], m.soundram[0x23],
+               m.soundram[0x24], m.soundram[0x25], m.soundram[0x26], m.soundram[0x27]);
     }
 
     int pal_nz = 0; for (int i = 0; i < 0x800; i++) if (m.paletteram[i]) pal_nz++;
