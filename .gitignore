@@ -1,0 +1,9 @@
+# build outputs (decoded ROMs, exes, captured frames)
+/build/
+
+# object files
+*.o
+*.obj
+
+# copyrighted ROM material — never commit
+/roms/
