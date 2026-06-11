@@ -1,43 +1,44 @@
-// Windows reference host for wbml: SDL2 window, input, 60Hz loop.
+// Windows reference host for wbml: SDL2 window, config menu, input, 60Hz loop.
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "machine.h"
 #include "video.h"
+#include "cfg.h"
+#include "menu.h"
 
-// Input bit layout (active-high in sys_inputs; inverted on read).
-// P1: b1 button2 (jump), b2 button1 (attack), b4 down, b5 up, b6 right, b7 left
-// SYSTEM: b0 coin1, b1 coin2, b3 service1, b4 start1, b5 start2
-//
-// Keys:  arrows = move   Z = jump   X = attack
-//        C = rapid left/right turbo (alternates every frame)
-//        5 = insert coin   1 = 1P start   2 = 2P start   9 = service   ESC = quit
-static void poll_input(system2 *m) {
+static void poll_input(system2 *m, const wbml_cfg *cfg, SDL_Joystick *joy) {
     static unsigned turbo_tick = 0;
     turbo_tick++;
 
     const Uint8 *k = SDL_GetKeyboardState(NULL);
     uint8_t p1 = 0, sys = 0;
 
-    if (k[SDL_SCANCODE_LEFT])  p1 |= 0x80;
-    if (k[SDL_SCANCODE_RIGHT]) p1 |= 0x40;
-    if (k[SDL_SCANCODE_UP])    p1 |= 0x20;
-    if (k[SDL_SCANCODE_DOWN])  p1 |= 0x10;
-    if (k[SDL_SCANCODE_Z]) p1 |= 0x02;  // jump   (button2)
-    if (k[SDL_SCANCODE_X]) p1 |= 0x04;  // attack (button1)
-
-    // C: 매 프레임 좌/우를 교대로 눌러 빠른 방향 전환
-    if (k[SDL_SCANCODE_C]) {
+    if (k[cfg->k_left])   p1 |= 0x80;
+    if (k[cfg->k_right])  p1 |= 0x40;
+    if (k[cfg->k_up])     p1 |= 0x20;
+    if (k[cfg->k_down])   p1 |= 0x10;
+    if (k[cfg->k_jump])   p1 |= 0x02;
+    if (k[cfg->k_attack]) p1 |= 0x04;
+    if (k[cfg->k_turbo])  {
         if ((turbo_tick >> 1) & 1) p1 |= 0x80; else p1 |= 0x40;
     }
+    if (k[cfg->k_coin])   sys |= 0x01;
+    if (k[cfg->k_start1]) sys |= 0x10;
 
-    if (k[SDL_SCANCODE_5]) sys |= 0x01;  // coin1
-    if (k[SDL_SCANCODE_6]) sys |= 0x02;  // coin2
-    if (k[SDL_SCANCODE_9]) sys |= 0x08;  // service1
-    if (k[SDL_SCANCODE_1]) sys |= 0x10;  // start1
-    if (k[SDL_SCANCODE_2]) sys |= 0x20;  // start2
+    if (joy) {
+        Sint16 ax = SDL_JoystickGetAxis(joy, cfg->joy_axis_x);
+        Sint16 ay = SDL_JoystickGetAxis(joy, cfg->joy_axis_y);
+        if (ax < -8000) p1 |= 0x80;
+        if (ax >  8000) p1 |= 0x40;
+        if (ay < -8000) p1 |= 0x20;
+        if (ay >  8000) p1 |= 0x10;
+        if (SDL_JoystickGetButton(joy, cfg->joy_btn_jump))   p1 |= 0x02;
+        if (SDL_JoystickGetButton(joy, cfg->joy_btn_attack)) p1 |= 0x04;
+    }
 
-    m->in.p1 = p1;
+    m->in.p1  = p1;
     m->in.system = sys;
 }
 
@@ -61,13 +62,27 @@ int main(int argc, char **argv) {
         }
     }
 
-    // crisp integer-scaled pixels (nearest-neighbour, no blur)
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
+
+    // Load config (SDL_GetPrefPath gives a writable per-user directory)
+    static char cfg_path[512];
+    {
+        char *pref = SDL_GetPrefPath("wbml", "wbml");
+        if (pref) {
+            snprintf(cfg_path, sizeof(cfg_path), "%swbml.cfg", pref);
+            SDL_free(pref);
+        } else {
+            SDL_strlcpy(cfg_path, "wbml.cfg", sizeof(cfg_path));
+        }
+    }
+    wbml_cfg cfg;
+    cfg_defaults(&cfg);
+    cfg_load(&cfg, cfg_path);
 
     SDL_AudioSpec want, have;
     SDL_zero(want);
@@ -78,9 +93,6 @@ int main(int argc, char **argv) {
     SDL_AudioDeviceID adev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (adev) SDL_PauseAudioDevice(adev, 0);
 
-    // The renderer produces a 512-wide buffer, but that is just the native
-    // 256-wide image doubled horizontally (background samples at x/2, sprite
-    // pixels are drawn twice). Present at the real 256x224 with square pixels.
     const int DISP_W = SCREEN_W / 2;  // 256
     const int DISP_H = SCREEN_H;      // 224
 
@@ -92,32 +104,45 @@ int main(int argc, char **argv) {
     SDL_Renderer *ren = SDL_CreateRenderer(
         win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     SDL_RenderSetLogicalSize(ren, DISP_W, DISP_H);
-    SDL_RenderSetIntegerScale(ren, SDL_TRUE);  // keep pixels crisp
+    SDL_RenderSetIntegerScale(ren, SDL_TRUE);
     SDL_Texture *tex = SDL_CreateTexture(
         ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
         DISP_W, DISP_H);
 
-    static uint32_t fb[SCREEN_W * SCREEN_H];
-    static uint32_t disp[256 * 224];  // 256x224 downsampled present buffer
-    int running = 1;
+    // Show config menu before game
     int headless_frames = 0;
     for (int i = 1; i < argc; i++)
         if (SDL_strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             headless_frames = atoi(argv[i + 1]);
 
+    if (!headless_frames) {
+        if (!run_menu(ren, &cfg, cfg_path)) {
+            SDL_DestroyTexture(tex);
+            SDL_DestroyRenderer(ren);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 0;
+        }
+    }
+
+    // Open joystick if configured
+    SDL_Joystick *joy = NULL;
+    if (cfg.joy_index >= 0 && cfg.joy_index < SDL_NumJoysticks())
+        joy = SDL_JoystickOpen(cfg.joy_index);
+
+    static uint32_t fb[SCREEN_W * SCREEN_H];
+    static uint32_t disp[256 * 224];
+    int running = 1;
+
     Uint64 freq = SDL_GetPerformanceFrequency();
     Uint64 prev = SDL_GetPerformanceCounter();
-    double accum = 0.0;
     const double frame_s = 1.0 / 60.06;
     long frame = 0;
 
-    if (!headless_frames) {
-        printf("Wonder Boy: Monster Land (reference)\n"
-               "  Arrows = move   Z = jump   X = attack   C = turbo L/R\n"
-               "  5 = insert coin   1 = 1P start   2 = 2P start\n"
-               "  9 = service   F12 = screenshot   ESC = quit\n");
-        fflush(stdout);
-    }
+    printf("Wonder Boy: Monster Land (reference)\n");
+    printf("  Z=jump  X=attack  C=turbo-LR\n");
+    printf("  5=coin  1=start   F12=screenshot  ESC=quit\n");
+    fflush(stdout);
 
     while (running) {
         SDL_Event e;
@@ -125,7 +150,6 @@ int main(int argc, char **argv) {
             if (e.type == SDL_QUIT) running = 0;
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = 0;
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F12) {
-                // dump current framebuffer to a PPM for inspection
                 char name[64];
                 snprintf(name, sizeof(name), "build/frame_%ld.ppm", frame);
                 FILE *f = fopen(name, "wb");
@@ -134,8 +158,8 @@ int main(int argc, char **argv) {
                     for (int p = 0; p < SCREEN_W * SCREEN_H; p++) {
                         uint32_t c = fb[p];
                         fputc((c >> 16) & 0xff, f);
-                        fputc((c >> 8) & 0xff, f);
-                        fputc(c & 0xff, f);
+                        fputc((c >>  8) & 0xff, f);
+                        fputc( c        & 0xff, f);
                     }
                     fclose(f);
                     printf("wrote %s\n", name);
@@ -143,18 +167,15 @@ int main(int argc, char **argv) {
             }
         }
 
-        poll_input(&m);
+        poll_input(&m, &cfg, joy);
         static int16_t audio[AUDIO_MAX_FRAME];
         int nsamp = machine_run_frame(&m, fb, audio);
         if (adev) {
-            // avoid unbounded latency build-up if rendering outpaces playback
             if (SDL_GetQueuedAudioSize(adev) < (Uint32)(AUDIO_SAMPLE_RATE / 4 * sizeof(int16_t)))
                 SDL_QueueAudio(adev, audio, nsamp * sizeof(int16_t));
         }
         frame++;
 
-        // downsample 512 -> 256 by taking every other column (the pairs are
-        // identical), giving the native image with no blur
         for (int y = 0; y < DISP_H; y++) {
             const uint32_t *src = &fb[y * SCREEN_W];
             uint32_t *dst = &disp[y * DISP_W];
@@ -166,15 +187,14 @@ int main(int argc, char **argv) {
         SDL_RenderPresent(ren);
 
         if (headless_frames && frame >= headless_frames) {
-            // write final frame and exit (for automated checks)
             FILE *f = fopen("build/headless.ppm", "wb");
             if (f) {
                 fprintf(f, "P6\n%d %d\n255\n", SCREEN_W, SCREEN_H);
                 for (int p = 0; p < SCREEN_W * SCREEN_H; p++) {
                     uint32_t c = fb[p];
                     fputc((c >> 16) & 0xff, f);
-                    fputc((c >> 8) & 0xff, f);
-                    fputc(c & 0xff, f);
+                    fputc((c >>  8) & 0xff, f);
+                    fputc( c        & 0xff, f);
                 }
                 fclose(f);
                 printf("headless: wrote build/headless.ppm after %ld frames\n", frame);
@@ -182,10 +202,7 @@ int main(int argc, char **argv) {
             running = 0;
         }
 
-        // Pace to ~60.06Hz. Cooperates with vsync: whichever waits longer wins,
-        // so this caps refresh on >60Hz monitors and keeps audio from starving.
-        (void)accum;
-        if (headless_frames) continue;  // run flat-out for automated capture
+        if (headless_frames) continue;
         double target_ticks = frame_s * (double)freq;
         for (;;) {
             Uint64 now = SDL_GetPerformanceCounter();
@@ -196,6 +213,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (joy) SDL_JoystickClose(joy);
     SDL_DestroyTexture(tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
