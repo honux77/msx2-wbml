@@ -28,7 +28,7 @@ static void poll_input(system2 *m) {
 
     // C: 매 프레임 좌/우를 교대로 눌러 빠른 방향 전환
     if (k[SDL_SCANCODE_C]) {
-        if (turbo_tick & 1) p1 |= 0x80; else p1 |= 0x40;
+        if ((turbo_tick >> 1) & 1) p1 |= 0x80; else p1 |= 0x40;
     }
 
     if (k[SDL_SCANCODE_5]) sys |= 0x01;  // coin1
